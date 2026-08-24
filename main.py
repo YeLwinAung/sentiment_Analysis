@@ -584,7 +584,7 @@ elif st.session_state.current_page == "movie_details":
         met4.metric("Total Reviews", total_revs)
 
         st.divider()
-        st.subheader("User Reviews")
+        st.subheader("Reviews")
 
         # Interactive User Review Input Block
         with st.container():
@@ -597,7 +597,7 @@ elif st.session_state.current_page == "movie_details":
 
             col_post, _ = st.columns([2, 5])
             with col_post:
-                post_submit = st.button("Submit Review", type="primary", use_container_width=True)
+                post_submit = st.button("Post Review", type="primary", use_container_width=True)
 
             if post_submit:
                 if not review_input.strip():
