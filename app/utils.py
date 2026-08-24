@@ -8,9 +8,10 @@ import numpy as np
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
-# Download NLTK resources
 nltk.download("stopwords", quiet=True)
 nltk.download("wordnet", quiet=True)
+nltk.download("omw-1.4", quiet=True)
+nltk.download("punkt", quiet=True)
 
 # Preserve negation and contrast words from stopword stripping
 NLTK_STOP_WORDS: Set[str] = set(stopwords.words("english"))
