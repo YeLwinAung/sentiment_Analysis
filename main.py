@@ -1,5 +1,3 @@
-# main.py
-
 import ast
 import json
 import os
@@ -143,6 +141,7 @@ st.markdown(
     .badge-neg               { background-color: #4A2511; color: #FB923C; border: 1px solid #F97316; } 
     .badge-very-neg          { background-color: #4A1E1E; color: #EB5757; border: 1px solid #EB5757; } 
     .badge-overwhelmingly-neg{ background-color: #3A0A0A; color: #FF4D4D; border: 1px solid #FF0000; } 
+    .badge-sarcastic         { background-color: #4C1D95; color: #C084FC; border: 1px solid #A855F7; }
      
     /* Container card for posted reviews */
     .review-card { 
@@ -194,7 +193,6 @@ def safe_extract_names(raw_val, limit=5):
     
     val_str = str(raw_val).strip()
     
-    # Extract name fields using regular expression pattern matching
     extracted_names = re.findall(r"'name':\s*'([^']*)'", val_str)
     if not extracted_names:
         extracted_names = re.findall(r'"name":\s*"([^"]*)"', val_str)
@@ -202,7 +200,6 @@ def safe_extract_names(raw_val, limit=5):
     if extracted_names:
         return ", ".join(extracted_names[:limit])
 
-    # Abstract Syntax Tree evaluation for complex literal structures
     try:
         data = ast.literal_eval(val_str)
         if isinstance(data, list):
@@ -225,8 +222,15 @@ def load_relational_dataset():
     if not os.path.exists(data_dir):
         data_dir = os.path.join("data", "raw", "TMDB")
 
+    if not os.path.exists(data_dir):
+        return pd.DataFrame(), pd.DataFrame()
+
     try:
-        movies_df = pd.read_csv(os.path.join(data_dir, "movies.csv"), engine="python", on_bad_lines="skip")
+        movies_path = os.path.join(data_dir, "movies.csv")
+        if not os.path.exists(movies_path):
+            return pd.DataFrame(), pd.DataFrame()
+
+        movies_df = pd.read_csv(movies_path, engine="python", on_bad_lines="skip")
         
         cast_df = pd.DataFrame()
         crew_df = pd.DataFrame()
@@ -239,7 +243,6 @@ def load_relational_dataset():
         if os.path.exists(os.path.join(data_dir, "reviews.csv")):
             reviews_df = pd.read_csv(os.path.join(data_dir, "reviews.csv"), engine="python", on_bad_lines="skip")
 
-        # Standardize primary key column identifiers across loaded dataframes
         for df in [movies_df, cast_df, crew_df, reviews_df]:
             if not df.empty:
                 if 'id' in df.columns and 'movie_id' not in df.columns:
@@ -250,7 +253,6 @@ def load_relational_dataset():
         movies_df = movies_df.dropna(subset=['movie_id'])
         movies_df['movie_id'] = movies_df['movie_id'].astype(int)
 
-        # Merge top-billed cast members for each movie
         if not cast_df.empty and 'movie_id' in cast_df.columns and 'name' in cast_df.columns:
             cast_df['movie_id'] = pd.to_numeric(cast_df['movie_id'], errors='coerce')
             cast_df = cast_df.dropna(subset=['movie_id'])
@@ -270,7 +272,6 @@ def load_relational_dataset():
         elif 'cast' in movies_df.columns:
             movies_df['cast'] = movies_df['cast'].apply(lambda x: safe_extract_names(x, 5))
 
-        # Merge designated directors from crew dataset
         if not crew_df.empty and 'movie_id' in crew_df.columns and 'name' in crew_df.columns:
             crew_df['movie_id'] = pd.to_numeric(crew_df['movie_id'], errors='coerce')
             crew_df = crew_df.dropna(subset=['movie_id'])
@@ -295,7 +296,6 @@ def load_relational_dataset():
         if 'genres' in movies_df.columns:
             movies_df['genres'] = movies_df['genres'].apply(safe_extract_names)
 
-        print("[BACKEND LOG] Dataset initialized.")
         return movies_df, reviews_df
 
     except Exception as e:
@@ -324,27 +324,49 @@ def get_7tier_sentiment(prob: float) -> tuple[str, str]:
         return "OVERWHELMINGLY NEGATIVE", "badge-overwhelmingly-neg"
 
 
+def _extract_probability(output: Any) -> float:
+    """Safely extracts positive probability regardless of whether predictor returned dict, tuple, or float."""
+    if isinstance(output, dict):
+        return float(output.get("positive_prob", output.get("prob", 0.5)))
+    elif isinstance(output, (tuple, list)):
+        return float(output[1]) if len(output) > 1 else float(output[0])
+    elif isinstance(output, (float, int)):
+        return float(output)
+    return 0.5
+
+
 def analyze_review_text(review: str) -> dict:
-    """Ensembles prediction outputs across all available sentiment models to derive average probability."""
-    models = {
+    """Ensembles prediction outputs across sentiment models and evaluates for sarcasm."""
+    is_sarcastic = False
+    try:
+        sarcasm_res = predict_sarcasm(review)
+        if isinstance(sarcasm_res, (tuple, list)):
+            is_sarcastic = bool(sarcasm_res[0])
+        elif isinstance(sarcasm_res, dict):
+            is_sarcastic = bool(sarcasm_res.get("is_sarcastic", False))
+    except Exception:
+        pass
+
+    raw_models = {
         "Naive Bayes": predict_naive_bayes(review),
         "Logistic Regression": predict_logistic_regression(review),
         "LSTM": predict_lstm(review),
         "DistilBERT": predict_distilbert(review),
     }
 
-    total_prob = sum(
-        float(output.get("positive_prob", 0.5)) if isinstance(output, dict) else 0.5
-        for output in models.values()
-    )
+    probs = [_extract_probability(val) for val in raw_models.values()]
+    avg_prob = sum(probs) / len(probs) if probs else 0.5
 
-    avg_prob = total_prob / len(models)
-    rating_label, badge_class = get_7tier_sentiment(avg_prob)
+    if is_sarcastic:
+        rating_label, badge_class = "SARCASTIC", "badge-sarcastic"
+    else:
+        rating_label, badge_class = get_7tier_sentiment(avg_prob)
 
     return {
         "rating": rating_label,
         "badge_class": badge_class,
-        "positive_prob": avg_prob
+        "positive_prob": avg_prob,
+        "is_sarcastic": is_sarcastic,
     }
 
 
@@ -371,7 +393,6 @@ def get_or_init_movie_reviews(movie_id):
 
                 author = r_row.get("author", generate_username())
                 
-                # Lexicon keyword frequency heuristic to initialize baseline scores across 7 classes
                 pos_words = ["masterpiece", "excellent", "great", "amazing", "love", "enjoyed", "best", "brilliant"]
                 neg_words = ["terrible", "horrible", "awful", "worst", "boring", "waste", "poor", "disappointing"]
                 
@@ -417,7 +438,6 @@ def calculate_overall_sentiment(reviews_list):
     total_reviews = len(reviews_list)
     avg_pos_prob = sum(r["positive_prob"] for r in reviews_list) / total_reviews
 
-    # Count reviews leaning positive (prob >= 0.55) vs negative (prob < 0.45)
     pos_count = sum(1 for r in reviews_list if r["positive_prob"] >= 0.55)
     neg_count = sum(1 for r in reviews_list if r["positive_prob"] < 0.45)
 
@@ -453,7 +473,7 @@ def go_to_catalog():
 nav_col1, nav_col2 = st.columns([6, 1])
 with nav_col1:
     st.markdown(
-        '<span class="imdb-brand">IMDb</span><span class="nav-title">Movie Reviews </span>',
+        '<span class="imdb-brand">IMDb</span><span class="nav-title">Movie Reviews</span>',
         unsafe_allow_html=True,
     )
 with nav_col2:
@@ -467,7 +487,7 @@ st.divider()
 # Main Movie Catalog Page View
 if st.session_state.current_page == "catalog":
     if movies_df.empty:
-        st.warning("No movie records found.")
+        st.warning("No movie records found. Please ensure dataset CSV files exist in data/raw/TMDB/.")
     else:
         st.subheader("Movies")
 
