@@ -85,23 +85,39 @@ def safe_extract_names(raw_val, limit=5):
 
 @st.cache_data
 def load_relational_dataset():
-    data_dir = os.path.join(BASE_DIR, "data", "raw", "TMDB")
-    if not os.path.exists(data_dir):
-        data_dir = os.path.join("data", "raw", "TMDB")
+    # Target directory paths to locate movies.csv dynamic to repo structure
+    candidate_dirs = [
+        os.path.join(BASE_DIR, "data", "raw", "TMDB"),
+        os.path.join(BASE_DIR, "sentiment_Analysis", "data", "raw", "TMDB"),
+        os.path.join(os.path.dirname(BASE_DIR), "sentiment_Analysis", "data", "raw", "TMDB"),
+        os.path.join(BASE_DIR, "data", "raw"),
+        os.path.join(BASE_DIR, "data"),
+        BASE_DIR,
+    ]
 
-    if not os.path.exists(data_dir):
+    data_dir = None
+    for c_dir in candidate_dirs:
+        if os.path.exists(os.path.join(c_dir, "movies.csv")):
+            data_dir = c_dir
+            break
+
+    if not data_dir:
+        st.error("Could not find movies.csv in any expected data folder.")
         return pd.DataFrame(), pd.DataFrame()
 
     try:
         movies_path = os.path.join(data_dir, "movies.csv")
-        if not os.path.exists(movies_path):
+        movies_df = pd.read_csv(movies_path, engine="python", on_bad_lines="skip")
+
+        # Check for un-pulled Git LFS pointer text file
+        if not movies_df.empty and "version https://git-lfs" in str(movies_df.columns[0]):
+            st.error("Git LFS pointer file detected! Run `git lfs pull` in your terminal to fetch raw dataset files.")
             return pd.DataFrame(), pd.DataFrame()
 
-        movies_df = pd.read_csv(movies_path, engine="python", on_bad_lines="skip")
         reviews_df = pd.DataFrame()
-
-        if os.path.exists(os.path.join(data_dir, "reviews.csv")):
-            reviews_df = pd.read_csv(os.path.join(data_dir, "reviews.csv"), engine="python", on_bad_lines="skip")
+        reviews_path = os.path.join(data_dir, "reviews.csv")
+        if os.path.exists(reviews_path):
+            reviews_df = pd.read_csv(reviews_path, engine="python", on_bad_lines="skip")
 
         for df in [movies_df, reviews_df]:
             if not df.empty:
@@ -120,11 +136,8 @@ def load_relational_dataset():
 
         return movies_df, reviews_df
     except Exception as e:
-        print(f"[BACKEND ERROR] Loader failure: {e}")
+        st.error(f"[BACKEND ERROR] Dataset loader failure: {e}")
         return pd.DataFrame(), pd.DataFrame()
-
-
-movies_df, dataset_reviews_df = load_relational_dataset()
 
 
 def get_7tier_sentiment(prob: float) -> tuple[str, str]:
