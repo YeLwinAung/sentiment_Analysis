@@ -1,367 +1,407 @@
 import os
 import pickle
+import re
 import sys
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict
+
+# Set environment variables for TensorFlow logging and optimization
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+# Add application and source directories to python path
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(APP_DIR)
+SRC_DIR = os.path.join(BASE_DIR, "src")
+
+for path in [BASE_DIR, SRC_DIR, APP_DIR]:
+    if os.path.exists(path) and path not in sys.path:
+        sys.path.insert(0, path)
 
 import numpy as np
-import streamlit as st
+import tensorflow as tf
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-# Configure dynamic base directory paths relative to the current file location
-BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
-
-# Import string preprocessing and calibration utilities safely
+# Optional spaCy import handling
 try:
-    from app.utils import calibrate_probability, clean_text
+    import spacy
 except ImportError:
-    # Fallback definition for clean_text if module resolution fails in cloud
-    def clean_text(text: str) -> str:
-        return text.strip().lower()
+    spacy = None
 
-    # Fallback definition for probability calibration
-    def calibrate_probability(text: str, prob: float) -> float:
-        return prob
+nlp = None
 
-# Directory paths configured dynamically for root or subfolder repositories
-MODEL_DIR: str = os.path.join(BASE_DIR, "models")
-DISTILBERT_DIR: str = os.path.join(MODEL_DIR, "distilbert_model")
-SARCASM_DIR: str = os.path.join(MODEL_DIR, "roberta_sarcasm")
-
-MAX_SEQUENCE_LENGTH: int = 200
-BERT_MAX_LENGTH: int = 128
-
-# Sarcasm confidence evaluation threshold
-SARCASM_THRESHOLD: float = 0.85
-
-
-# ============================================================
-# PICKLE MODEL LOADING
-# ============================================================
-
-@st.cache_resource
-def _load_pickle(filename: str) -> Any:
-    # Build complete path to locate target pickle file inside models directory
-    filepath = os.path.join(MODEL_DIR, filename)
-
-    # Alternate lookup directory if models folder is located at app level
-    if not os.path.exists(filepath):
-        filepath = os.path.join(BASE_DIR, "app", "models", filename)
-
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Pickle file missing: {filepath}")
-
-    with open(filepath, "rb") as file:
-        return pickle.load(file)
-
-
-@st.cache_resource
-def get_tfidf():
-    # Cache TF-IDF vectorizer resource
-    return _load_pickle("tfidf_vectorizer.pkl")
-
-
-@st.cache_resource
-def get_naive_bayes():
-    # Cache Naive Bayes classification model resource
-    return _load_pickle("naive_bayes_model.pkl")
-
-
-@st.cache_resource
-def get_logistic_regression():
-    # Cache Logistic Regression classification model resource
-    return _load_pickle("logistic_regression_model.pkl")
-
-
-@st.cache_resource
-def get_lstm_tokenizer():
-    # Cache LSTM text tokenizer resource
-    return _load_pickle("tokenizer.pkl")
-
-
-# ============================================================
-# LSTM LOADING
-# ============================================================
-
-@st.cache_resource
-def get_lstm_model():
-    # Deferred TensorFlow import prevents memory spikes during initial app boot
-    from tensorflow.keras.models import load_model
-
-    model_path = os.path.join(MODEL_DIR, "lstm_model.keras")
-
-    if not os.path.exists(model_path):
-        model_path = os.path.join(BASE_DIR, "app", "models", "lstm_model.keras")
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"LSTM model file missing: {model_path}")
-
-    return load_model(model_path)
-
-
-# ============================================================
-# DISTILBERT LOADING
-# ============================================================
-
-@st.cache_resource
-def get_distilbert():
-    # Deferred PyTorch and HuggingFace import for cloud optimization
-    import torch
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    target_dir = DISTILBERT_DIR
-    if not os.path.exists(target_dir):
-        target_dir = os.path.join(BASE_DIR, "app", "models", "distilbert_model")
-
-    if not os.path.exists(target_dir):
-        raise FileNotFoundError(f"DistilBERT directory missing: {target_dir}")
-
-    tokenizer = AutoTokenizer.from_pretrained(target_dir, local_files_only=True)
-    model = AutoModelForSequenceClassification.from_pretrained(target_dir, local_files_only=True)
-    model.eval()
-
-    return tokenizer, model
-
-
-# ============================================================
-# SARCASM MODEL LOADING
-# ============================================================
-
-@st.cache_resource
-def get_sarcasm_model():
-    # Lazy import RoBERTa model modules on demand
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    target_dir = SARCASM_DIR
-    if not os.path.exists(target_dir):
-        target_dir = os.path.join(BASE_DIR, "app", "models", "roberta_sarcasm")
-
-    if not os.path.exists(target_dir):
-        raise FileNotFoundError(f"Sarcasm directory missing: {target_dir}")
-
-    tokenizer = AutoTokenizer.from_pretrained(target_dir, local_files_only=True)
-    model = AutoModelForSequenceClassification.from_pretrained(target_dir, local_files_only=True)
-    model.eval()
-
-    return tokenizer, model
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def _extract_positive_index(model_classes: np.ndarray) -> int:
-    # Identify array index corresponding to positive sentiment label
-    classes_list = list(model_classes)
-    for index, label in enumerate(classes_list):
-        if str(label).lower() in ["positive", "pos", "1"]:
-            return index
-    return 1
-
-
-def _extract_bert_positive_index(bert_model) -> int:
-    # Determine positive index mapping from transformer config dictionary
-    if hasattr(bert_model.config, "id2label"):
-        for index, label in bert_model.config.id2label.items():
-            if "positive" in str(label).lower():
-                return int(index)
-    return 1
-
-
-def _extract_sarcasm_index(roberta_model) -> int:
-    # Identify sarcasm index in RoBERTa classification header
-    if hasattr(roberta_model.config, "id2label"):
-        for index, label in roberta_model.config.id2label.items():
-            label_text = str(label).lower()
-            if any(key in label_text for key in ["sarcastic", "sarcasm", "pos", "1"]):
-                return int(index)
-    return 1
-
-
-# ============================================================
-# SARCASM PREDICTION
-# ============================================================
-
-def predict_sarcasm(review: str) -> Tuple[bool, float]:
-    # Returns default fallback values if heavy sarcasm weights are missing in deployment
+if spacy is not None:
     try:
-        import torch
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        nlp = None
 
-        roberta_tokenizer, roberta_model = get_sarcasm_model()
+# Import project utilities
+from utils import ID2LABEL, process_sentiment_output
 
-        inputs = roberta_tokenizer(
-            review,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=BERT_MAX_LENGTH,
-        )
-
-        with torch.no_grad():
-            outputs = roberta_model(**inputs)
-
-        probabilities = torch.softmax(outputs.logits, dim=1)[0]
-        sarcasm_idx = _extract_sarcasm_index(roberta_model)
-        sarcasm_prob = float(probabilities[sarcasm_idx].item())
-        is_sarcastic = sarcasm_prob >= SARCASM_THRESHOLD
-
-        return is_sarcastic, round(sarcasm_prob, 4)
-    except Exception:
-        # Graceful fallback when transformer model files are omitted from Git
-        return False, 0.0
+# Directory configuration for saved models and global cache initialization
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+_model_cache: Dict[str, Any] = {}
 
 
-# ============================================================
-# SENTIMENT ADJUSTMENT
-# ============================================================
+def normalize_typos_and_elongations(text: str) -> str:
+    """Normalize repeated characters and common informal expressions."""
+    text = re.sub(r"(.)\1{2,}", r"\1", text)
 
-def _apply_sarcasm_adjustment(raw_prob: float, is_sarcastic: bool, sarcasm_prob: float) -> float:
-    # Rebalance probability score if text evaluates as sarcastic
-    if is_sarcastic:
-        weight = (sarcasm_prob - SARCASM_THRESHOLD) / (1.0 - SARCASM_THRESHOLD)
-        weight = max(0.0, min(1.0, weight))
-        inverted = 1.0 - raw_prob
-        return raw_prob * (1 - weight) + inverted * weight
-
-    return raw_prob
-
-
-def derive_7class_sentiment(prob: float) -> str:
-    # Categorize raw numerical probability into 7-tier scale label
-    if prob >= 0.90:
-        return "Overwhelmingly Positive"
-    elif prob >= 0.75:
-        return "Very Positive"
-    elif prob >= 0.55:
-        return "Positive"
-    elif prob >= 0.45:
-        return "Mixed"
-    elif prob >= 0.25:
-        return "Negative"
-    elif prob >= 0.10:
-        return "Very Negative"
-    else:
-        return "Overwhelmingly Negative"
-
-
-def _build_result(review: str, raw_prob: float) -> Dict[str, Any]:
-    # Consolidate prediction metrics into result dictionary format
-    raw_prob = max(0.0, min(1.0, raw_prob))
-
-    is_sarcastic, sarcasm_prob = predict_sarcasm(review)
-    adjusted_prob = _apply_sarcasm_adjustment(raw_prob, is_sarcastic, sarcasm_prob)
-
-    calibrated_prob = calibrate_probability(review, adjusted_prob)
-    calibrated_prob = max(0.0, min(1.0, float(calibrated_prob)))
-
-    return {
-        "sentiment": derive_7class_sentiment(calibrated_prob),
-        "positive_prob": round(calibrated_prob, 4),
-        "is_sarcastic": is_sarcastic,
-        "sarcasm_prob": sarcasm_prob,
+    slang_map = {
+        "luvd": "loved",
+        "luvs": "loves",
+        "awsum": "awesome",
+        "freaking": "really",
     }
 
+    tokens = text.split()
 
-# ============================================================
-# NAIVE BAYES
-# ============================================================
+    return " ".join(slang_map.get(token.lower(), token) for token in tokens)
 
-def predict_naive_bayes(review: str) -> Dict[str, Any]:
-    # Execute inference using cached Naive Bayes model
+
+def enhanced_clean_raw(text: str) -> str:
+    """Clean text while preserving original capitalization."""
+    return normalize_typos_and_elongations(text.strip())
+
+
+def enhanced_clean_text(text: str) -> str:
+    """Clean and lowercase text for traditional ML models."""
+    return normalize_typos_and_elongations(text.lower().strip())
+
+
+def detect_idiomatic_adverbs(text: str) -> bool:
+    """Detect expressions like 'like it bad', 'love it crazy', 'enjoy it hard'."""
+    if nlp is None:
+        return False
+
+    doc = nlp(text.lower())
+
+    positive_verbs = {
+        "like",
+        "love",
+        "enjoy",
+        "want",
+        "miss",
+        "dig",
+    }
+
+    intensifier_modifiers = {
+        "bad",
+        "hard",
+        "crazy",
+    }
+
+    for token in doc:
+        if token.text in intensifier_modifiers and token.dep_ == "advmod":
+            if (
+                token.head.lemma_ in positive_verbs
+                and token.head.pos_ in {"VERB", "HEAD"}
+            ):
+                return True
+
+    return False
+
+
+def adjust_for_structural_patterns(text: str, score: float) -> float:
+    """Adjust sentiment score using linguistic patterns."""
+    lower_text = text.lower()
+
+    # Idiomatic positive expressions check
+    if detect_idiomatic_adverbs(text):
+        score = max(score, 0.90)
+
+    # Double negation patterns matching
+    double_neg_pattern = (
+        r"\b(can'?t|cannot)\s+say\s+(?:that\s+)?i\s+didn'?t\b|\bdidn'?t\s+dislike\b"
+    )
+
+    if re.search(double_neg_pattern, lower_text):
+        if score < 0.50:
+            score = 0.65 + (0.50 - score) * 0.40
+
+    # Contrastive language pattern adjustments
+    contrast_words = [
+        " but ",
+        " however ",
+        " although ",
+        " yet ",
+    ]
+
+    if any(word in lower_text for word in contrast_words):
+        score = 0.50 + (score - 0.50) * 0.35
+
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def get_sarcasm():
+    """Load and cache the sarcasm detection model."""
+    if "sarcasm" not in _model_cache:
+        path = os.path.join(MODELS_DIR, "roberta_sarcasm")
+
+        tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+
+        model = AutoModelForSequenceClassification.from_pretrained(
+            path, local_files_only=True
+        ).eval()
+
+        _model_cache["sarcasm"] = (tokenizer, model)
+
+    return _model_cache["sarcasm"]
+
+
+def get_distilbert():
+    """Load and cache the DistilBERT sentiment model."""
+    if "distilbert" not in _model_cache:
+        path = os.path.join(MODELS_DIR, "distilbert_model")
+
+        tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+
+        model = AutoModelForSequenceClassification.from_pretrained(
+            path, local_files_only=True
+        ).eval()
+
+        _model_cache["distilbert"] = (tokenizer, model)
+
+    return _model_cache["distilbert"]
+
+
+def get_naive_bayes():
+    """Load and cache Naive Bayes and TF-IDF models."""
+    if "naive_bayes" not in _model_cache:
+        nb_path = os.path.join(MODELS_DIR, "naive_bayes_model.pkl")
+
+        tfidf_path = os.path.join(MODELS_DIR, "tfidf_vectorizer.pkl")
+
+        with open(nb_path, "rb") as file:
+            nb_model = pickle.load(file)
+
+        with open(tfidf_path, "rb") as file:
+            tfidf = pickle.load(file)
+
+        _model_cache["naive_bayes"] = (nb_model, tfidf)
+
+    return _model_cache["naive_bayes"]
+
+
+def get_logistic_regression():
+    """Load and cache Logistic Regression model."""
+    if "logistic" not in _model_cache:
+        lr_path = os.path.join(MODELS_DIR, "logistic_regression_model.pkl")
+
+        with open(lr_path, "rb") as file:
+            lr_model = pickle.load(file)
+
+        _, tfidf = get_naive_bayes()
+
+        _model_cache["logistic"] = (lr_model, tfidf)
+
+    return _model_cache["logistic"]
+
+
+def get_bilstm():
+    """Load and cache BiLSTM model and tokenizer."""
+    if "bilstm" not in _model_cache:
+        lstm_path = os.path.join(MODELS_DIR, "lstm_model.keras")
+
+        tokenizer_path = os.path.join(MODELS_DIR, "tokenizer.pkl")
+
+        lstm_model = tf.keras.models.load_model(lstm_path)
+
+        with open(tokenizer_path, "rb") as file:
+            tokenizer = pickle.load(file)
+
+        _model_cache["bilstm"] = (lstm_model, tokenizer)
+
+    return _model_cache["bilstm"]
+
+
+def _run_model_pipeline(
+    model_name: str,
+    text: str,
+    prob_extractor: Callable[[str], np.ndarray],
+) -> Dict[str, Any]:
+    """Run probability extraction and sentiment calibration."""
     try:
-        tfidf = get_tfidf()
-        naive_bayes = get_naive_bayes()
+        probs = prob_extractor(text)
 
-        text = clean_text(review) or review
-        vector = tfidf.transform([text])
+        score_weights = np.array([0.0, 0.25, 0.50, 0.75, 1.0])
 
-        probabilities = naive_bayes.predict_proba(vector)[0]
-        pos_idx = _extract_positive_index(naive_bayes.classes_)
+        raw_score = float(np.sum(probs * score_weights))
 
-        return _build_result(review, float(probabilities[pos_idx]))
+        adjusted_score = adjust_for_structural_patterns(text, raw_score)
+
+        processed = process_sentiment_output(text, adjusted_score)
+
+        return {
+            "model": model_name,
+            "class_id": processed["predicted_id"],
+            "sentiment": processed["predicted_label"],
+            "confidence": round(float(np.max(probs)), 4),
+            "positive_prob": processed["calibrated_score"],
+            "probabilities": [round(float(prob), 4) for prob in probs],
+        }
+
     except Exception:
-        # Fallback baseline score if pickle model file is not present
-        return _build_result(review, 0.50)
+        return {
+            "model": model_name,
+            "class_id": 2,
+            "sentiment": "Neutral",
+            "confidence": 0.20,
+            "positive_prob": 0.50,
+            "probabilities": [0.20] * 5,
+        }
 
 
-# ============================================================
-# LOGISTIC REGRESSION
-# ============================================================
-
-def predict_logistic_regression(review: str) -> Dict[str, Any]:
-    # Execute inference using cached Logistic Regression model
+def predict_sarcasm(text: str) -> Dict[str, Any]:
+    """Predict whether the review is sarcastic."""
     try:
-        tfidf = get_tfidf()
-        logistic_model = get_logistic_regression()
+        tokenizer, model = get_sarcasm()
 
-        text = clean_text(review) or review
-        vector = tfidf.transform([text])
+        raw_text = enhanced_clean_raw(text)
 
-        probabilities = logistic_model.predict_proba(vector)[0]
-        pos_idx = _extract_positive_index(logistic_model.classes_)
-
-        return _build_result(review, float(probabilities[pos_idx]))
-    except Exception:
-        # Fallback baseline score if pickle model file is not present
-        return _build_result(review, 0.50)
-
-
-# ============================================================
-# LSTM
-# ============================================================
-
-def predict_lstm(review: str) -> Dict[str, Any]:
-    # Execute inference using cached Keras LSTM network
-    try:
-        from tensorflow.keras.preprocessing.sequence import pad_sequences
-
-        lstm_model = get_lstm_model()
-        lstm_tokenizer = get_lstm_tokenizer()
-
-        text = clean_text(review) or review
-        sequence = lstm_tokenizer.texts_to_sequences([text])
-
-        padded_sequence = pad_sequences(
-            sequence,
-            maxlen=MAX_SEQUENCE_LENGTH,
-            padding="pre",
-            truncating="pre",
-        )
-
-        raw_prob = float(lstm_model.predict(padded_sequence, verbose=0)[0][0])
-        return _build_result(review, raw_prob)
-    except Exception:
-        # Fallback score if TensorFlow environment fails or binary is missing
-        return _build_result(review, 0.50)
-
-
-# ============================================================
-# DISTILBERT
-# ============================================================
-
-def predict_distilbert(review: str) -> Dict[str, Any]:
-    # Execute inference using cached DistilBERT transformer
-    try:
-        import torch
-
-        bert_tokenizer, bert_model = get_distilbert()
-
-        inputs = bert_tokenizer(
-            review,
+        inputs = tokenizer(
+            raw_text,
             return_tensors="pt",
             truncation=True,
+            max_length=128,
             padding=True,
-            max_length=BERT_MAX_LENGTH,
         )
 
         with torch.no_grad():
-            outputs = bert_model(**inputs)
+            probs = torch.softmax(model(**inputs).logits, dim=-1)[0].cpu().numpy()
 
-        probabilities = torch.softmax(outputs.logits, dim=1)[0]
-        pos_idx = _extract_bert_positive_index(bert_model)
+        sarcasm_prob = (
+            float(probs[1]) if len(probs) > 1 else float(probs[0])
+        )
 
-        raw_prob = float(probabilities[pos_idx].item())
-        return _build_result(review, raw_prob)
+        # Suppress false positives for very short reviews
+        if len(raw_text.strip().split()) <= 4:
+            sarcasm_prob = min(sarcasm_prob, 0.20)
+
+        return {
+            "is_sarcastic": sarcasm_prob >= 0.85,
+            "sarcasm_prob": round(sarcasm_prob, 4),
+        }
+
     except Exception:
-        # Fallback baseline score if transformer directory is missing
-        return _build_result(review, 0.50)
+        return {
+            "is_sarcastic": False,
+            "sarcasm_prob": 0.0,
+        }
+
+
+def predict_distilbert(text: str) -> Dict[str, Any]:
+    """Predict sentiment using DistilBERT."""
+    try:
+        tokenizer, model = get_distilbert()
+
+        raw_text = enhanced_clean_raw(text)
+
+        inputs = tokenizer(
+            raw_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=128,
+            padding=True,
+        )
+
+        with torch.no_grad():
+            probs = torch.softmax(model(**inputs).logits, dim=-1)[0].cpu().numpy()
+
+        pred_class_id = int(np.argmax(probs))
+
+        score_weights = np.array([0.0, 0.25, 0.50, 0.75, 1.0])
+
+        raw_score = float(np.sum(probs * score_weights))
+
+        # Sarcasm probability check and score adjustment
+        sarcasm_result = predict_sarcasm(text)
+
+        if pred_class_id in [3, 4] and sarcasm_result["is_sarcastic"]:
+            raw_score *= 1.0 - sarcasm_result["sarcasm_prob"]
+
+        adjusted_score = adjust_for_structural_patterns(text, raw_score)
+
+        processed = process_sentiment_output(text, adjusted_score)
+
+        return {
+            "model": "DistilBERT",
+            "class_id": processed["predicted_id"],
+            "sentiment": processed["predicted_label"],
+            "confidence": round(float(np.max(probs)), 4),
+            "positive_prob": processed["calibrated_score"],
+            "probabilities": [round(float(prob), 4) for prob in probs],
+            "is_sarcastic": sarcasm_result["is_sarcastic"],
+            "sarcasm_prob": sarcasm_result["sarcasm_prob"],
+        }
+
+    except Exception:
+        return {
+            "model": "DistilBERT",
+            "class_id": 2,
+            "sentiment": "Neutral",
+            "confidence": 0.20,
+            "positive_prob": 0.50,
+            "probabilities": [0.20] * 5,
+        }
+
+
+def predict_naive_bayes(text: str) -> Dict[str, Any]:
+    """Predict sentiment using Naive Bayes."""
+
+    def extract(review: str) -> np.ndarray:
+        model, tfidf = get_naive_bayes()
+
+        transformed = tfidf.transform([enhanced_clean_text(review)])
+
+        return model.predict_proba(transformed)[0]
+
+    return _run_model_pipeline("Naive Bayes", text, extract)
+
+
+def predict_logistic_regression(text: str) -> Dict[str, Any]:
+    """Predict sentiment using Logistic Regression."""
+
+    def extract(review: str) -> np.ndarray:
+        model, tfidf = get_logistic_regression()
+
+        transformed = tfidf.transform([enhanced_clean_text(review)])
+
+        return model.predict_proba(transformed)[0]
+
+    return _run_model_pipeline("Logistic Regression", text, extract)
+
+
+def predict_bilstm(text: str) -> Dict[str, Any]:
+    """Predict sentiment using BiLSTM."""
+
+    def extract(review: str) -> np.ndarray:
+        model, tokenizer = get_bilstm()
+
+        sequences = tokenizer.texts_to_sequences([enhanced_clean_text(review)])
+
+        padded = tf.keras.preprocessing.sequence.pad_sequences(
+            sequences,
+            maxlen=100,
+            padding="post",
+            truncating="post",
+        )
+
+        return model.predict(padded, verbose=0)[0]
+
+    return _run_model_pipeline("BiLSTM", text, extract)
+
+
+# Backwards compatibility reference
+predict_lstm = predict_bilstm
+
+
+def predict_all_models(text: str) -> Dict[str, Dict[str, Any]]:
+    """Run prediction across all sentiment models."""
+    return {
+        "distilbert": predict_distilbert(text),
+        "logistic_regression": predict_logistic_regression(text),
+        "naive_bayes": predict_naive_bayes(text),
+        "bilstm": predict_bilstm(text),
+    }
